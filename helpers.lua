@@ -3,16 +3,64 @@ local ffi = require('ffi')
 
 local helpers = {}
 
+-- memory safety
+
+ffi.cdef [[
+    typedef struct {
+        void*  BaseAddress;
+        void*  AllocationBase;
+        DWORD  AllocationProtect;
+        SIZE_T RegionSize;
+        DWORD  State;
+        DWORD  Protect;
+        DWORD  Type;
+    } balloon_memory_basic_information_t;
+]]
+pcall(ffi.cdef, 'SIZE_T VirtualQuery(LPCVOID lpAddress, balloon_memory_basic_information_t* lpBuffer, SIZE_T dwLength);')
+
+local MEM_COMMIT = 0x1000
+local PAGE_NOACCESS = 0x01
+local PAGE_GUARD = 0x100
+local PAGE_READABLE = bit.bor(0x02, 0x04, 0x08, 0x20, 0x40, 0x80) -- READONLY, READWRITE, WRITECOPY and the EXECUTE_ variants
+local memory_info = ffi.new('balloon_memory_basic_information_t')
+
+-- Returns true if `size` bytes at `address` are committed, readable memory.
+-- Game pointers can briefly point at freed memory (e.g. while a menu closes), and reading
+-- through one raises an access violation that pcall can't catch, so check before reading.
+helpers.is_readable = function(address, size)
+    if type(address) ~= 'number' or address < 0x10000 then
+        return false
+    end
+    if ffi.C.VirtualQuery(ffi.cast('LPCVOID', address), memory_info, ffi.sizeof(memory_info)) == 0 then
+        return false
+    end
+    if memory_info.State ~= MEM_COMMIT or bit.band(memory_info.Protect, bit.bor(PAGE_NOACCESS, PAGE_GUARD)) ~= 0 or
+        bit.band(memory_info.Protect, PAGE_READABLE) == 0 then
+        return false
+    end
+    local region_end = tonumber(ffi.cast('uint32_t', memory_info.BaseAddress)) + tonumber(memory_info.RegionSize)
+    return address + size <= region_end
+end
+
 -- game menu
 
 local pGameMenu = ashita.memory.find('FFXiMain.dll', 0, '8B480C85C974??8B510885D274??3B05', 16, 0)
 helpers.get_game_menu_name = function()
+    if not helpers.is_readable(pGameMenu, 4) then
+        return ''
+    end
     local menu_pointer = ashita.memory.read_uint32(pGameMenu)
+    if not helpers.is_readable(menu_pointer, 4) then
+        return ''
+    end
     local menu_val = ashita.memory.read_uint32(menu_pointer)
-    if menu_val == 0 then
+    if menu_val == 0 or not helpers.is_readable(menu_val + 4, 4) then
         return ''
     end
     local menu_header = ashita.memory.read_uint32(menu_val + 4)
+    if not helpers.is_readable(menu_header + 0x46, 16) then
+        return ''
+    end
     local menu_name = ashita.memory.read_string(menu_header + 0x46, 16)
     return string.gsub(menu_name, '\x00', ''):trimex()
 end
@@ -136,6 +184,13 @@ local stepdialog = T{
         this = ashita.memory.find('FFXiMain.dll', 0, '8B0D????????85C90F??????????8B410885C00F', 2, 0),
     },
 }
+-- FFXiMain.dll address range, used to check that a TkEventMsg2 object's vtable is genuine.
+local ffximain_base = ashita.memory.get_base('FFXiMain.dll') or 0
+local ffximain_end = ffximain_base + (ashita.memory.get_size('FFXiMain.dll') or 0)
+-- Minimum seconds between dialog steps; pressing again while the game swaps message objects can hit a freed one.
+local STEP_COOLDOWN = 0.25
+local last_step_time = 0
+
 helpers.stepdialog = {}
 helpers.stepdialog.available = stepdialog.ptrs:all(function(v) return v ~= nil and v ~= 0; end)
 helpers.stepdialog.run = function()
@@ -144,15 +199,35 @@ helpers.stepdialog.run = function()
         return false
     end
 
+    local now = os.clock()
+    if now - last_step_time < STEP_COOLDOWN then
+        return false
+    end
+
     -- Obtain the current TkEventMsg2 object pointer
+    if not helpers.is_readable(stepdialog.ptrs.this, 4) then
+        return false
+    end
     local ptr = ashita.memory.read_uint32(stepdialog.ptrs.this)
-    if ptr == nil or ptr == 0 then
+    if ptr == nil or ptr == 0 or not helpers.is_readable(ptr, 4) then
         return false
     end
     ptr = ashita.memory.read_uint32(ptr)
-    if ptr == nil or ptr == 0 then
+    if ptr == nil or ptr == 0 or not helpers.is_readable(ptr, 4) then
         return false
     end
+
+    -- A live object's first field is its vtable inside FFXiMain.dll. If the message window was just
+    -- freed (the game is moving to the next message), calling into it jumps to a garbage address.
+    local vtable = ashita.memory.read_uint32(ptr)
+    if ffximain_base == 0 or vtable < ffximain_base or vtable >= ffximain_end then
+        if not helpers.stepdialog.reported_skip then
+            helpers.stepdialog.reported_skip = true
+            print(string.format('[balloon] Skipped a dialog step: message object not ready (vtable %08X). Press Enter again.', vtable))
+        end
+        return false
+    end
+    last_step_time = now
 
     -- Obtain the TkEventMsg2::OnKeyDown function pointer
     local func = ffi.cast('TkEventMsg2_OnKeyDown_f', stepdialog.ptrs.func)
@@ -164,5 +239,10 @@ helpers.stepdialog.run = function()
     func(ptr, 5, 0xFFFF)
     return true
 end
+
+-- OnKeyDown shows the next message, which raises text_in and re-enters this addon's Lua state
+-- while the FFI call is still on the stack. LuaJIT doesn't support that from JIT-compiled code
+-- (it caused occasional access violations in key_data), so keep this function interpreted.
+jit.off(helpers.stepdialog.run)
 
 return helpers
